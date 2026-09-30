@@ -394,6 +394,145 @@ class ReleaseResponse(StrictModel):
     input_hash: str
 
 
+# ---------------------------------------------------------------------------
+# Redundant-sensor trusted-majority quorum
+# ---------------------------------------------------------------------------
+
+
+class MajoritySensorSpec(StrictModel):
+    """One redundant sensor participating in a trusted-majority vote."""
+
+    sensor_id: SensorId
+
+
+class MajorityRequest(StrictModel):
+    """Parameters of one read-only trusted-majority evaluation of a batch.
+
+    At least two distinct redundant sensors vote over the half-open window
+    ``[window_start_ns, window_end_ns)``. ``q`` is the strict-majority quorum:
+    it must be strictly more than half of the sensors and at most their total
+    count. A span qualifies only when ``q`` voting values agree within
+    ``max_value_difference`` (max - min).
+    """
+
+    window_start_ns: int = Field(ge=0)
+    window_end_ns: int = Field(ge=1)
+    # Redundant sensors; at least two and duplicate-free.
+    sensors: list[MajoritySensorSpec] = Field(min_length=2)
+    # Unit every voting (calibrated) folded value must carry exactly.
+    expected_unit: UnitName
+    # Required agreeing votes: floor(n/2) + 1 <= q <= n (strict majority).
+    q: int = Field(ge=1)
+    # Non-negative finite inclusive spread allowed among agreeing votes:
+    # max(value) - min(value) <= max_value_difference.
+    max_value_difference: float = Field(
+        allow_inf_nan=False,
+        ge=0.0,
+        description="Inclusive maximum spread (max - min) of agreeing votes.",
+    )
+
+    @model_validator(mode="after")
+    def _check_window_sensors_and_quorum(self) -> "MajorityRequest":
+        if self.window_end_ns <= self.window_start_ns:
+            raise ValueError(
+                "window_end_ns must be strictly greater than window_start_ns"
+            )
+        ids = [s.sensor_id for s in self.sensors]
+        if len(ids) != len(set(ids)):
+            raise ValueError("sensors must not contain duplicate sensor_id entries")
+        strict_majority = len(ids) // 2 + 1
+        if not (strict_majority <= self.q <= len(ids)):
+            raise ValueError(
+                f"q must be a strict majority: {strict_majority} <= q <= "
+                f"{len(ids)} for {len(ids)} sensors"
+            )
+        return self
+
+
+class MajorityMember(StrictModel):
+    """One sensor whose calibrated vote belongs to the reported agreeing set."""
+
+    sensor_id: str
+    value: float
+    unit: str
+
+
+class MajorityNonVotingReason(StrictModel):
+    """Why one sensor is absent from the reported agreeing member set.
+
+    reason:
+      blocked        - a not-yet-grounded revision covers the span and masks
+                       the sensor's landed value (see missing_ancestors);
+      uncovered      - no grounded segment covers the span;
+      withdrawn      - the folded winner is a withdrawal tombstone;
+      unit_mismatch  - the folded value carries a different unit;
+      value_divergent - the sensor voted, but its value is outside the chosen
+                       maximum-cardinality agreeing set.
+    """
+
+    sensor_id: str
+    reason: Literal[
+        "blocked", "uncovered", "withdrawn", "unit_mismatch", "value_divergent"
+    ]
+    # Folded value/unit on the span; null unless the sensor is calibrated there
+    # (blocked/withdrawn/uncovered expose no value).
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Distinct not-yet-uploaded terminal ancestors; populated for blocked
+    # sensors (sorted, ready for backfill), empty otherwise.
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class MajorityInterval(StrictModel):
+    """One merged half-open span with one trusted-majority verdict.
+
+    verdict:
+      qualified        - the largest agreeing voter set reaches q votes;
+      pending_backfill - it does not, but together with the currently blocked
+                         sensors the quorum is reachable after backfill;
+      unqualified      - the quorum is unreachable even after backfill.
+    """
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    verdict: Literal["qualified", "pending_backfill", "unqualified"]
+    # qualified: the chosen most-populous agreeing set (>= q members);
+    # otherwise: the largest agreeing set of currently voting sensors (< q).
+    # Ties resolve to the lexicographically smallest sorted sensor-id list.
+    members: list[MajorityMember] = Field(default_factory=list)
+    # Every queried sensor not in ``members`` with its reason, sorted by
+    # sensor_id: blocked / uncovered / withdrawn / unit_mismatch / divergent.
+    non_voting_sensors: list[MajorityNonVotingReason] = Field(default_factory=list)
+    # Union of the blocked sensors' distinct terminal missing ancestors
+    # (sorted, ready for backfill); non-empty mainly for pending_backfill.
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class MajorityResponse(StrictModel):
+    """Deterministic trusted-majority verdict for one batch over one window."""
+
+    batch_id: str
+    window_start_ns: int
+    window_end_ns: int
+    expected_unit: str
+    q: int
+    max_value_difference: float
+    # Queried sensor ids, echoed in request order.
+    sensors: list[str]
+    # qualified:        at least one span reaches q agreeing votes;
+    # pending_backfill: no qualified span but at least one span waits on
+    #                   backfill to possibly reach q;
+    # unqualified:      every span stays below q even after backfill.
+    status: Literal["qualified", "pending_backfill", "unqualified"]
+    # Contiguous, time-sorted partition of the whole half-open query window;
+    # adjacent spans merge only when verdict and the full evidence match.
+    intervals: list[MajorityInterval] = Field(default_factory=list)
+    # SHA-256 over the evaluation input (queried sensors' folded segments plus
+    # blocked spans); changes iff the snapshot input changes.
+    input_hash: str
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str

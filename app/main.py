@@ -19,6 +19,7 @@ from .engine import (
     evaluate_device_release,
     evaluate_quality_gate,
     evaluate_sample,
+    evaluate_sensor_majority,
     find_sensor_events,
     preview_submission,
 )
@@ -27,6 +28,8 @@ from .models import (
     CompareResponse,
     HealthResponse,
     IngestResponse,
+    MajorityRequest,
+    MajorityResponse,
     MeasurementEvent,
     PreviewResponse,
     QualityGateRequest,
@@ -364,6 +367,47 @@ def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
             ),
         )
     return ReleaseResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/majority",
+    response_model=MajorityResponse,
+    tags=["calibration"],
+    summary="Evaluate a trusted majority over redundant sensors and a window",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def sensor_majority(batch_id: str, query: MajorityRequest) -> MajorityResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    sensor_ids = [spec.sensor_id for spec in query.sensors]
+    # Read-only evaluation against one consistent batch snapshot: both the
+    # sensor-existence check and the sweep run under a single lock.
+    with store.lock:
+        doc = evaluate_sensor_majority(
+            batch_id,
+            query.window_start_ns,
+            query.window_end_ns,
+            sensor_ids,
+            query.expected_unit,
+            query.q,
+            query.max_value_difference,
+            batch,
+        )
+        known_sensors = {event.sensor_id for event in batch.events.values()}
+    if doc is None:
+        missing = sorted(
+            sensor_id for sensor_id in sensor_ids if sensor_id not in known_sensors
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"sensor(s) {missing} not found in batch {batch_id!r}"
+                if len(missing) > 1
+                else f"sensor {missing[0]!r} not found in batch {batch_id!r}"
+            ),
+        )
+    return MajorityResponse(**doc)
 
 
 @app.post(
