@@ -394,6 +394,150 @@ class ReleaseResponse(StrictModel):
     input_hash: str
 
 
+class RedundancyVoteRequest(StrictModel):
+    """Parameters of one read-only redundant-sensor quorum evaluation.
+
+    The query window is the half-open nanosecond interval
+    ``[window_start_ns, window_end_ns)``. On every elementary interval the
+    listed sensors cast at most one vote each: blocked coverage masks the
+    sensor's landed value (no vote, ``blocked``), and only ``calibrated``
+    values carrying exactly ``expected_unit`` may vote.
+    """
+
+    window_start_ns: int = Field(ge=0)
+    window_end_ns: int = Field(ge=1)
+    # Redundant sensor candidates; at least two distinct ids required.
+    sensor_ids: list[SensorId] = Field(min_length=2)
+    # Unit a folded calibrated value must carry exactly to be allowed to vote.
+    expected_unit: UnitName
+    # Required votes: strictly more than half of the listed sensors and at
+    # most their total count.
+    quorum: int = Field(ge=1)
+    # Non-negative inclusive spread: a voting set agrees iff its max value
+    # minus its min value does not exceed this threshold.
+    max_value_diff: float = Field(
+        allow_inf_nan=False,
+        description="Inclusive maximum max-minus-min spread of a qualifying set.",
+    )
+
+    @model_validator(mode="after")
+    def _check_params(self) -> "RedundancyVoteRequest":
+        if self.window_end_ns <= self.window_start_ns:
+            raise ValueError(
+                "window_end_ns must be strictly greater than window_start_ns"
+            )
+        if len(self.sensor_ids) != len(set(self.sensor_ids)):
+            raise ValueError("sensor_ids must not contain duplicate entries")
+        total = len(self.sensor_ids)
+        if self.quorum <= total // 2 or self.quorum > total:
+            raise ValueError(
+                f"quorum must be a strict majority of the {total} sensors "
+                f"({total // 2 + 1}..{total}) and at most their count"
+            )
+        if self.max_value_diff < 0:
+            raise ValueError("max_value_diff must be non-negative")
+        return self
+
+
+class QuorumVote(StrictModel):
+    """One sensor's cast vote on an elementary/merged interval."""
+
+    sensor_id: str
+    value: float
+    unit: str
+    # Winning folded revision supplying the value (traceability only; it does
+    # not participate in interval merging).
+    revision_id: str
+
+
+class QuorumNonVote(StrictModel):
+    """Why one listed sensor does not cast a vote on an interval.
+
+    blocked:        a not-yet-grounded revision covers the interval and masks
+                    the sensor's landed value; see missing_ancestors;
+    uncovered:      no grounded segment covers the interval;
+    withdrawn:      the folded winner is a withdrawal tombstone;
+    unit_mismatch:  the folded calibrated value carries another unit and is
+                    not allowed to vote.
+    """
+
+    sensor_id: str
+    reason: Literal["blocked", "uncovered", "withdrawn", "unit_mismatch"]
+    # Folded payload on the span; null except for unit_mismatch.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Distinct not-yet-uploaded terminal ancestors; populated for blocked
+    # entries (sorted, ready for backfill), empty otherwise.
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class QuorumMember(StrictModel):
+    """One sensor of the chosen qualifying set, with the value it cast."""
+
+    sensor_id: str
+    value: float
+    unit: str
+    revision_id: str
+
+
+class QuorumInterval(StrictModel):
+    """One merged half-open verdict interval of a redundancy vote query.
+
+    qualified:       a compatible voting set of at least ``quorum`` sensors
+                     exists; ``members`` lists the chosen set;
+    pending_backfill: no such set exists among the current votes, but the
+                     largest compatible voting set plus the blocked sensors
+                     could reach ``quorum`` after backfill;
+    rejected:        even that potential cannot reach the quorum.
+
+    Adjacent intervals merge only when verdict and the complete evidence
+    (members, per-sensor non-vote reasons and missing ancestors) are
+    identical.
+    """
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    status: Literal["qualified", "pending_backfill", "rejected"]
+    # Chosen largest compatible set (smallest sorted sensor-id tuple breaks
+    # size ties); empty unless status is qualified.
+    members: list[QuorumMember] = Field(default_factory=list)
+    # Every sensor that did not vote, sorted by sensor_id.
+    non_votes: list[QuorumNonVote] = Field(default_factory=list)
+    # Terminal missing ancestors across the blocked sensors (sorted, ready
+    # for backfill); populated for pending_backfill intervals, empty
+    # otherwise.
+    missing_ancestors: list[str] = Field(default_factory=list)
+    # Size of the largest compatible set among the votes that were cast
+    # (0 when fewer than two comparable values exist).
+    largest_compatible_size: int = 0
+    # Number of listed sensors masked by blocked coverage on the interval.
+    blocked_count: int = 0
+
+
+class RedundancyVoteResponse(StrictModel):
+    """Deterministic redundant-sensor quorum verdict for one batch/window."""
+
+    batch_id: str
+    window_start_ns: int
+    window_end_ns: int
+    sensor_ids: list[str]
+    expected_unit: str
+    quorum: int
+    max_value_diff: float
+    # qualified:       at least one qualified interval exists;
+    # pending_backfill: none qualified yet, but some interval may qualify
+    #                  after the indicated backfills;
+    # rejected:        every interval is rejected.
+    status: Literal["qualified", "pending_backfill", "rejected"]
+    # Contiguous, time-sorted, merged verdict intervals; together they are a
+    # partition of the half-open query window clipped to its bounds.
+    intervals: list[QuorumInterval] = Field(default_factory=list)
+    # SHA-256 over the evaluation input (listed sensors' folded segments plus
+    # blocked spans); changes iff the snapshot input changes.
+    input_hash: str
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str

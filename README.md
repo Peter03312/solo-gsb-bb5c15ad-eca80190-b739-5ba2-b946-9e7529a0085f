@@ -7,8 +7,10 @@
 重复提交通过幂等键保证**幂等**；在真正提交前还可以**无副作用地预览**一次修订
 会给所属批次带来的影响（preview）；还可对**两个批次的同一传感器**做
 **差异对比审计（compare）**，对单个传感器的折叠时间线做
-**质量门禁评估（quality gate）**，以及在指定半开时段内判断
-**全部必需传感器何时同时满足标定条件的设备放行评估（release）**。
+**质量门禁评估（quality gate）**，在指定半开时段内判断
+**全部必需传感器何时同时满足标定条件的设备放行评估（release）**，
+以及对**两个及以上冗余传感器**做
+**可信多数投票评估（redundancy-vote）**。
 全部状态保存在**进程内存**中，可随时重置。
 
 ---
@@ -137,6 +139,28 @@ pytest -q
   后按时间排序，恰好覆盖整个查询窗口（半开、按窗口裁剪）。响应中的
   `input_hash` 是对各必需传感器扫描输入（折叠片段 + blocked 跨度）的
   SHA-256：快照输入不变则哈希不变，与窗口和放行参数无关。
+- **冗余传感器可信多数投票**（见 4.8）在同一次批次快照内对**两个及以上
+  不重复的冗余传感器**做只读扫描：在半开查询窗口
+  `[window_start_ns, window_end_ns)` 内逐基本区间判定，每个传感器至多投
+  一票，投票口径沿用同一套因果折叠结果——先按现有 **blocked 覆盖优先
+  规则遮蔽**该传感器的已落地值（被 blocked 修订覆盖即不投票，原因
+  `blocked`）；仅**未遮蔽且为 `calibrated`、单位与 `expected_unit`
+  完全一致**的值可投票（`withdrawn` → `withdrawn`、已落地片段之外 →
+  `uncovered`、单位不一致 → `unit_mismatch`，均不投票）；成环 invalid
+  修订不参与。当至少 `quorum`（**严格过半且不超过传感器总数**的票数 q）
+  个可投票值的**最大值与最小值之差不超过非负有限的 `max_value_diff`**
+  （闭边界）时该区间判 `qualified`：选择**人数最多的合格集合**，人数相同
+  取**传感器 ID 排序后字典序最小**者。否则，若**可投票值中最大可相容集合
+  人数 + blocked 传感器数**仍能达到 q，判 `pending_backfill`（待补传），
+  并在 `missing_ancestors` 中按字典序列出 blocked 传感器沿父链追溯到的
+  末端缺失祖先（去重，可直接照单补传）；其余判 `rejected`。相邻区间
+  **仅在判定与证据完全相同**（合格成员及其值/单位、每传感器未投票原因与
+  缺失祖先；仅来源修订 `revision_id` 不同不算证据差异）时合并。输出区间
+  按时间排序、恰好覆盖整个查询窗口（半开、按窗口裁剪）；每个区间回带
+  `non_votes`（未投票传感器及原因）、`largest_compatible_size` 与
+  `blocked_count`。响应中的 `input_hash` 是对各被查询传感器扫描输入
+  （折叠片段 + blocked 跨度）的 SHA-256：快照输入不变则哈希不变，与窗口、
+  期望单位、q 与阈值无关。查询不改任何状态。
 
 ---
 
@@ -550,6 +574,136 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/release \
 `not_released`、`released_intervals` 为空，这两段出现在
 `unreleased_intervals` 中并带 `"qualified": true, "too_short": true`。
 
+当两段合格区间都短于门槛（例如此处门槛改为 130ns）时，`status` 为
+`not_released`、`released_intervals` 为空，这两段出现在
+`unreleased_intervals` 中并带 `"qualified": true, "too_short": true`。
+
+### `POST /api/v1/batches/{batch_id}/redundancy-vote` — 冗余传感器可信多数投票
+
+对批次内**两个及以上不重复的冗余传感器**在指定半开时段
+`[window_start_ns, window_end_ns)` 内做只读扫描，逐基本区间判断是否存在
+**可信多数**（规则见第 3 节）。全部计算在同一次加锁内的同一批次快照上
+完成，不写入任何状态。
+
+请求体：
+
+```json
+{
+  "window_start_ns": 0,
+  "window_end_ns": 300,
+  "sensor_ids": ["S1", "S2", "S3"],
+  "expected_unit": "C",
+  "quorum": 2,
+  "max_value_diff": 0.5
+}
+```
+
+参数说明：
+
+- `window_start_ns` / `window_end_ns`：半开纳秒查询窗口，非负整数且
+  `window_end_ns > window_start_ns`；结果区间一律裁剪到该窗口内；
+- `sensor_ids`：冗余传感器 ID 列表，**至少 2 个且不可重复**；
+- `expected_unit`：期望单位（非空字符串）；只有折叠值单位与之**完全相等**
+  的 `calibrated` 值才可投票；
+- `quorum`：要求票数 q，必须**严格过半**（`q > len(sensor_ids) // 2`）且
+  **不超过传感器总数**（`q <= len(sensor_ids)`）。例如 3 个传感器只允许
+  `q=2` 或 `q=3`，2 个传感器只允许 `q=2`；
+- `max_value_diff`：非负有限浮点数（拒绝 NaN/Inf），一组可投票值合格当且
+  仅当 `max(values) - min(values) <= max_value_diff`（闭边界，`0.0` 合法，
+  表示必须严格相等）。
+
+逐基本区间判定：
+
+1. 每个传感器先按 **blocked 覆盖优先**规则遮蔽已落地值：该时刻被任何
+   blocked 修订覆盖即不投票，原因为 `blocked`（即使下方已有 grounded
+   标定值），并沿父链收集去重排序的末端缺失祖先；
+2. 未被遮蔽时，只有折叠赢家为 `calibrated` 且单位等于 `expected_unit` 才
+   投票；`withdrawn` 墓碑 → `withdrawn`、已落地片段之外 → `uncovered`、
+   单位不一致 → `unit_mismatch`（回带该折叠值/单位），均不投票；
+3. 在可投票值中枚举以某个出现值为最小值、宽度为 `max_value_diff` 的闭包络，
+   取**人数最多**的可相容集合；人数相同取**传感器 ID 排序后字典序最小**
+   的集合。其人数达到 q 判 `qualified`，`members` 列出该集合（含各传感器
+   投出的值、单位与获胜修订）；
+4. 否则若 `largest_compatible_size + blocked_count >= q`，判
+   `pending_backfill`（补传 blocked 传感器的缺失祖先后可能凑齐多数），
+   区间级 `missing_ancestors` 列出全部 blocked 传感器缺失祖先的并集
+   （排序）；达不到则判 `rejected`。
+
+响应字段：
+
+- `status`：`qualified`（存在至少一个合格区间）/ `pending_backfill`（无合格
+  区间但存在待补传区间）/ `rejected`（全部区间不合格）；
+- `intervals`：按时间排序的半开判定区间，**相邻区间仅在判定与证据完全相同
+  时合并**，整体恰好连续覆盖查询窗口。每个区间含：
+  - `start_ns` / `end_ns` / `duration_ns`（半开边界）；
+  - `status`：`qualified` / `pending_backfill` / `rejected`；
+  - `members`：选中的合格集合（仅 `qualified` 区间非空），每项含
+    `sensor_id`/`value`/`unit`/`revision_id`；
+  - `non_votes`：未投票传感器（按 `sensor_id` 排序），每项含 `sensor_id`、
+    `reason`（`blocked`/`uncovered`/`withdrawn`/`unit_mismatch`）、
+    `value`/`unit`（仅 `unit_mismatch` 回带折叠值）与该条目的
+    `missing_ancestors`（仅 `blocked` 非空）；
+  - `missing_ancestors`：待补传缺失祖先（仅 `pending_backfill` 非空，排序，
+    可直接照单补传）；
+  - `largest_compatible_size`：可投票值中最大可相容集合的人数；
+  - `blocked_count`：该区间上被 blocked 遮蔽的传感器数；
+- `input_hash`：对所有被查询传感器扫描输入（折叠片段 + blocked 跨度）的
+  SHA-256，快照输入不变则哈希不变，与窗口、期望单位、q 和阈值无关。
+
+批次不存在返回 `404`；任一被查询传感器在批次中未知返回 `404`。q 越界、
+传感器少于 2 个或重复、窗口无效（空或倒置）、`max_value_diff` 为负或
+NaN/Inf、缺少必填字段或含多余字段均返回 `422`。
+
+示例（B1 中 S1/S2/S3 三冗余、q=2、阈值 0.5；S1 在 [60,100) 被等待缺失
+祖先 `ghost` 的 blocked 修订遮蔽，S3 在 [40,100) 跳到 20.0）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B1/redundancy-vote \
+    -H 'Content-Type: application/json' \
+    -d '{"window_start_ns":0,"window_end_ns":100,
+         "sensor_ids":["S1","S2","S3"],"expected_unit":"C",
+         "quorum":2,"max_value_diff":0.5}'
+{
+  "batch_id": "B1",
+  "window_start_ns": 0,
+  "window_end_ns": 100,
+  "sensor_ids": ["S1", "S2", "S3"],
+  "expected_unit": "C",
+  "quorum": 2,
+  "max_value_diff": 0.5,
+  "status": "qualified",
+  "intervals": [
+    {"start_ns": 0, "end_ns": 40, "duration_ns": 40,
+     "status": "qualified",
+     "members": [
+       {"sensor_id": "S1", "value": 10.0, "unit": "C", "revision_id": "a"},
+       {"sensor_id": "S2", "value": 10.2, "unit": "C", "revision_id": "b"},
+       {"sensor_id": "S3", "value": 10.4, "unit": "C", "revision_id": "c1"}],
+     "non_votes": [], "missing_ancestors": [],
+     "largest_compatible_size": 3, "blocked_count": 0},
+    {"start_ns": 40, "end_ns": 60, "duration_ns": 20,
+     "status": "qualified",
+     "members": [
+       {"sensor_id": "S1", "value": 10.0, "unit": "C", "revision_id": "a"},
+       {"sensor_id": "S2", "value": 10.2, "unit": "C", "revision_id": "b"}],
+     "non_votes": [], "missing_ancestors": [],
+     "largest_compatible_size": 2, "blocked_count": 0},
+    {"start_ns": 60, "end_ns": 100, "duration_ns": 40,
+     "status": "pending_backfill",
+     "members": [],
+     "non_votes": [
+       {"sensor_id": "S1", "reason": "blocked", "value": null, "unit": null,
+        "missing_ancestors": ["ghost"]}],
+     "missing_ancestors": ["ghost"],
+     "largest_compatible_size": 1, "blocked_count": 1}
+  ],
+  "input_hash": "…"
+}
+```
+
+补传 `ghost`（及其到 ROOT 的缺失链）后再次查询，[60,100) 会按新的折叠
+赢家重新判定。
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -615,6 +769,18 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/release \
 #   -> status="released"，released_intervals 为达门槛的连续同时合格段，
 #      其余区间（blocked/withdrawn/uncovered/unit_mismatch/out_of_bounds
 #      或时长不足的合格段）在 unreleased_intervals 中按传感器给出原因
+
+# 7) 冗余传感器可信多数投票：S1/S2/S3 三个冗余传感器，严格多数 q=2，
+#    可投票值极差不超过 0.5 即合格；被 blocked 遮蔽的传感器不投票，
+#    现有票数 + blocked 数仍可凑齐 q 时判 pending_backfill 并列出缺失祖先
+curl -s -X POST localhost:8080/api/v1/batches/B42/redundancy-vote \
+  -H 'Content-Type: application/json' \
+  -d '{"window_start_ns":0,"window_end_ns":300,"sensor_ids":["S1","S2","S3"],
+       "expected_unit":"C","quorum":2,"max_value_diff":0.5}'
+#   -> status="qualified"（存在合格区间时），intervals 恰好半开覆盖
+#      [0,300)；qualified 区间带 members（人数最多、同票取 ID 字典序最小
+#      的合格集合），non_votes 列出 blocked/withdrawn/uncovered/
+#      unit_mismatch 的传感器，pending_backfill 区间带 missing_ancestors
 curl -s -X POST localhost:8080/admin/reset
 ```
 
@@ -635,12 +801,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / redundancy-vote / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余可信多数投票扫描、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储、幂等判定与无副作用的提交预览判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 130 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 161 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

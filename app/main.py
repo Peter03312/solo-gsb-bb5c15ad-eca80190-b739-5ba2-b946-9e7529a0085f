@@ -18,6 +18,7 @@ from .engine import (
     evaluate_batch,
     evaluate_device_release,
     evaluate_quality_gate,
+    evaluate_redundancy_vote,
     evaluate_sample,
     find_sensor_events,
     preview_submission,
@@ -31,6 +32,8 @@ from .models import (
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
+    RedundancyVoteRequest,
+    RedundancyVoteResponse,
     ReleaseRequest,
     ReleaseResponse,
     ResetResponse,
@@ -364,6 +367,50 @@ def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
             ),
         )
     return ReleaseResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/redundancy-vote",
+    response_model=RedundancyVoteResponse,
+    tags=["calibration"],
+    summary="Evaluate redundant-sensor trusted-majority voting over a window",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def redundancy_vote(
+    batch_id: str, query: RedundancyVoteRequest
+) -> RedundancyVoteResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    # Read-only evaluation against one consistent batch snapshot: both the
+    # sensor-existence check and the sweep run under a single lock.
+    with store.lock:
+        doc = evaluate_redundancy_vote(
+            batch_id,
+            query.window_start_ns,
+            query.window_end_ns,
+            query.sensor_ids,
+            query.expected_unit,
+            query.quorum,
+            query.max_value_diff,
+            batch,
+        )
+        known_sensors = {event.sensor_id for event in batch.events.values()}
+    if doc is None:
+        missing = sorted(
+            sensor_id
+            for sensor_id in dict.fromkeys(query.sensor_ids)
+            if sensor_id not in known_sensors
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"sensor(s) {missing} not found in batch {batch_id!r}"
+                if len(missing) > 1
+                else f"sensor {missing[0]!r} not found in batch {batch_id!r}"
+            ),
+        )
+    return RedundancyVoteResponse(**doc)
 
 
 @app.post(

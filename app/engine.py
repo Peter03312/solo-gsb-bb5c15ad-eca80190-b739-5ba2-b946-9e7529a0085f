@@ -1251,3 +1251,335 @@ def evaluate_device_release(
         "unreleased_intervals": unreleased,
         "input_hash": hash_release_input(views),
     }
+
+
+# ---------------------------------------------------------------------------
+# Redundant-sensor quorum voting
+# ---------------------------------------------------------------------------
+
+# Verdict kinds emitted by the quorum scan.
+QUORUM_QUALIFIED = "qualified"
+QUORUM_PENDING = "pending_backfill"
+QUORUM_REJECTED = "rejected"
+
+# Non-vote reasons.
+VOTE_BLOCKED = "blocked"
+VOTE_UNCOVERED = "uncovered"
+VOTE_WITHDRAWN = "withdrawn"
+VOTE_UNIT_MISMATCH = "unit_mismatch"
+
+
+def hash_vote_input(views: list[dict]) -> str:
+    """Stable SHA-256 over a quorum query's per-sensor scan input.
+
+    Covers every listed sensor's folded grounded segments plus its blocked
+    revision spans, so the hash changes exactly when the evaluation input
+    changes (window, expected unit, quorum and spread do not affect it).
+    """
+    payload = json.dumps(
+        [
+            {
+                "sensor_id": view["sensor_id"],
+                "segments": [segment_to_dict(s) for s in view["segments"]],
+                "blocked": [
+                    {
+                        "start_ns": e.start_ns,
+                        "end_ns": e.end_ns,
+                        "revision_id": e.revision_id,
+                    }
+                    for e in view["blocked"]
+                ],
+            }
+            for view in sorted(views, key=lambda v: v["sensor_id"])
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _largest_compatible_set(
+    votes: list[dict], max_value_diff: float
+) -> tuple[list[dict], int]:
+    """Choose the largest vote subset whose max-minus-min spread fits.
+
+    Every maximum-cardinality compatible subset is obtained by fixing one
+    present value ``v`` as the minimum and taking every vote with a value in
+    ``[v, v + max_value_diff]`` (a compatible set can always be extended to
+    that envelope). Among largest sets the lexicographically smallest tuple
+    of sorted sensor ids wins. Returns ``(members, size)``; members are
+    returned sorted by sensor id.
+    """
+    if not votes:
+        return [], 0
+    ordered = sorted(votes, key=lambda v: (v["value"], v["sensor_id"]))
+    best: Optional[list[dict]] = None
+    best_key: Optional[tuple] = None
+    distinct_values = sorted({v["value"] for v in ordered})
+    for floor in distinct_values:
+        ceiling = floor + max_value_diff
+        chosen = [v for v in ordered if floor <= v["value"] <= ceiling]
+        key = tuple(sorted(v["sensor_id"] for v in chosen))
+        if best_key is None or len(key) > len(best_key) or (
+            len(key) == len(best_key) and key < best_key
+        ):
+            best, best_key = chosen, key
+    assert best is not None
+    return sorted(best, key=lambda v: v["sensor_id"]), len(best)
+
+
+def evaluate_redundancy_vote(
+    batch_id: str,
+    window_start_ns: int,
+    window_end_ns: int,
+    sensor_ids: list[str],
+    expected_unit: str,
+    quorum: int,
+    max_value_diff: float,
+    store: BatchStore,
+) -> Optional[dict]:
+    """Scan redundant sensors for a trusted-majority agreement over a window.
+
+    Deterministic sweep over the half-open query window against one batch
+    snapshot. On every elementary interval each listed sensor contributes at
+    most one vote: blocked coverage masks its landed value (``blocked`` takes
+    precedence, exactly as in sample/gate/release scans); otherwise only a
+    ``calibrated`` folded value carrying exactly ``expected_unit`` votes.
+    Invalid (cycle) revisions never participate.
+
+    An interval is ``qualified`` when the largest compatible vote set
+    (max-minus-min spread within ``max_value_diff``) has at least ``quorum``
+    members; ties pick the set whose sorted sensor-id tuple is
+    lexicographically smallest. Otherwise it is ``pending_backfill`` when
+    that set's size plus the number of blocked sensors could still reach
+    ``quorum`` (missing terminal ancestors are listed for backfill), and
+    ``rejected`` when it cannot.
+
+    Adjacent elementary intervals merge only when verdict and the complete
+    evidence (members, per-sensor non-vote reasons and missing ancestors) are
+    identical. Returns ``None`` when any listed sensor is unknown in batch.
+    """
+    by_sensor = group_by_sensor(store)
+    if any(sensor_id not in by_sensor for sensor_id in sensor_ids):
+        return None
+
+    views: list[dict] = []
+    points: set[int] = {window_start_ns, window_end_ns}
+    for sensor_id in sensor_ids:
+        sensor_events = by_sensor[sensor_id]
+        states, depths = classify_sensor(sensor_events)
+        segments = build_timeline(
+            [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED],
+            depths,
+        )
+        blocked = sorted(
+            (e for e in sensor_events.values() if states[e.revision_id] == BLOCKED),
+            key=lambda e: (e.start_ns, e.end_ns, e.revision_id),
+        )
+        for seg in segments:
+            points.update((seg.start_ns, seg.end_ns))
+        for event in blocked:
+            points.update((event.start_ns, event.end_ns))
+        views.append(
+            {
+                "sensor_id": sensor_id,
+                "events": sensor_events,
+                "segments": segments,
+                "blocked": blocked,
+                "seg_index": 0,
+            }
+        )
+
+    sweep = sorted(p for p in points if window_start_ns < p < window_end_ns)
+    boundaries = [window_start_ns, *sweep, window_end_ns]
+
+    elementary: list[dict] = []
+    for lo, hi in zip(boundaries, boundaries[1:]):
+        votes: list[dict] = []
+        non_votes: list[dict] = []
+        for view in views:
+            sensor_id = view["sensor_id"]
+            covering = [
+                e for e in view["blocked"] if e.start_ns <= lo < e.end_ns
+            ]
+            if covering:
+                # Blocked coverage masks any landed value: the sensor cannot
+                # vote, but a backfill could still make it a voter.
+                non_votes.append(
+                    {
+                        "sensor_id": sensor_id,
+                        "reason": VOTE_BLOCKED,
+                        "value": None,
+                        "unit": None,
+                        "missing_ancestors": _terminal_missing_ancestors(
+                            [e.revision_id for e in covering], view["events"]
+                        ),
+                    }
+                )
+                continue
+
+            segments = view["segments"]
+            idx = view["seg_index"]
+            while idx < len(segments) and segments[idx].end_ns <= lo:
+                idx += 1
+            view["seg_index"] = idx
+            seg = (
+                segments[idx]
+                if idx < len(segments) and segments[idx].start_ns <= lo
+                else None
+            )
+            if seg is None:
+                non_votes.append(
+                    {
+                        "sensor_id": sensor_id,
+                        "reason": VOTE_UNCOVERED,
+                        "value": None,
+                        "unit": None,
+                        "missing_ancestors": [],
+                    }
+                )
+            elif seg.state == "withdrawn":
+                non_votes.append(
+                    {
+                        "sensor_id": sensor_id,
+                        "reason": VOTE_WITHDRAWN,
+                        "value": None,
+                        "unit": None,
+                        "missing_ancestors": [],
+                    }
+                )
+            elif seg.unit != expected_unit:
+                non_votes.append(
+                    {
+                        "sensor_id": sensor_id,
+                        "reason": VOTE_UNIT_MISMATCH,
+                        "value": seg.value,
+                        "unit": seg.unit,
+                        "missing_ancestors": [],
+                    }
+                )
+            else:
+                votes.append(
+                    {
+                        "sensor_id": sensor_id,
+                        "value": seg.value,
+                        "unit": seg.unit,
+                        "revision_id": seg.revision_id,
+                    }
+                )
+
+        members, compatible_size = _largest_compatible_set(votes, max_value_diff)
+        blocked_entries = [n for n in non_votes if n["reason"] == VOTE_BLOCKED]
+        blocked_count = len(blocked_entries)
+        missing = sorted(
+            {ancestor for n in blocked_entries for ancestor in n["missing_ancestors"]}
+        )
+
+        if compatible_size >= quorum:
+            status = QUORUM_QUALIFIED
+        elif compatible_size + blocked_count >= quorum:
+            status = QUORUM_PENDING
+        else:
+            status = QUORUM_REJECTED
+
+        elementary.append(
+            {
+                "start_ns": lo,
+                "end_ns": hi,
+                "status": status,
+                "members": members if status == QUORUM_QUALIFIED else [],
+                "non_votes": sorted(non_votes, key=lambda n: n["sensor_id"]),
+                "missing_ancestors": missing if status == QUORUM_PENDING else [],
+                "largest_compatible_size": compatible_size,
+                "blocked_count": blocked_count,
+            }
+        )
+
+    intervals: list[dict] = []
+    for cand in elementary:
+        if intervals and intervals[-1]["end_ns"] == cand["start_ns"]:
+            prev = intervals[-1]
+            if _vote_evidence_fingerprint(prev) == _vote_evidence_fingerprint(cand):
+                prev["end_ns"] = cand["end_ns"]
+                continue
+        intervals.append(dict(cand))
+
+    if any(i["status"] == QUORUM_QUALIFIED for i in intervals):
+        overall = QUORUM_QUALIFIED
+    elif any(i["status"] == QUORUM_PENDING for i in intervals):
+        overall = QUORUM_PENDING
+    else:
+        overall = QUORUM_REJECTED
+
+    out_intervals = []
+    for interval in intervals:
+        out_intervals.append(
+            {
+                "start_ns": interval["start_ns"],
+                "end_ns": interval["end_ns"],
+                "duration_ns": interval["end_ns"] - interval["start_ns"],
+                "status": interval["status"],
+                "members": [
+                    {
+                        "sensor_id": m["sensor_id"],
+                        "value": m["value"],
+                        "unit": m["unit"],
+                        "revision_id": m["revision_id"],
+                    }
+                    for m in interval["members"]
+                ],
+                "non_votes": interval["non_votes"],
+                "missing_ancestors": interval["missing_ancestors"],
+                "largest_compatible_size": interval["largest_compatible_size"],
+                "blocked_count": interval["blocked_count"],
+            }
+        )
+
+    return {
+        "batch_id": batch_id,
+        "window_start_ns": window_start_ns,
+        "window_end_ns": window_end_ns,
+        "sensor_ids": sensor_ids,
+        "expected_unit": expected_unit,
+        "quorum": quorum,
+        "max_value_diff": max_value_diff,
+        "status": overall,
+        "intervals": out_intervals,
+        "input_hash": hash_vote_input(views),
+    }
+
+
+def _vote_evidence_fingerprint(interval: dict) -> str:
+    """Canonical evidence key used to decide adjacent-interval merging.
+
+    Revision provenance is deliberately excluded: members vote with their
+    effective values, and provenance-only differences do not split the
+    verdict (mirroring the compare/preview effective-state convention).
+    """
+    payload = json.dumps(
+        {
+            "status": interval["status"],
+            "members": [
+                {"sensor_id": m["sensor_id"], "value": m["value"], "unit": m["unit"]}
+                for m in sorted(interval["members"], key=lambda m: m["sensor_id"])
+            ],
+            "non_votes": [
+                {
+                    "sensor_id": n["sensor_id"],
+                    "reason": n["reason"],
+                    "value": n["value"],
+                    "unit": n["unit"],
+                    "missing_ancestors": sorted(n["missing_ancestors"]),
+                }
+                for n in sorted(interval["non_votes"], key=lambda n: n["sensor_id"])
+            ],
+            "missing_ancestors": sorted(interval["missing_ancestors"]),
+            "largest_compatible_size": interval["largest_compatible_size"],
+            "blocked_count": interval["blocked_count"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
